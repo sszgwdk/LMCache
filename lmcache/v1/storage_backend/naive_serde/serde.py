@@ -2,6 +2,9 @@
 # Standard
 import abc
 
+# Third Party
+import torch
+
 # First Party
 from lmcache.v1.memory_management import MemoryObj
 
@@ -15,6 +18,16 @@ class Serializer(metaclass=abc.ABCMeta):
         Input:
             memory_obj: the memory object to be serialized/compressed.
 
+        Returns:
+            MemoryObj: the serialized/compressed memory object.
+        """
+        raise NotImplementedError
+    def serialize_tensor(self, tensor: torch.Tensor) -> MemoryObj:
+        """
+        Serialize/compress the tensor.
+
+        Input:
+            tensor: the tensor to be serialized/compressed.
         Returns:
             MemoryObj: the serialized/compressed memory object.
         """

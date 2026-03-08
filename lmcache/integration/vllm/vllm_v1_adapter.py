@@ -1321,7 +1321,7 @@ class LMCacheConnectorV1Impl:
             #     logger.warning(
             #         f"Request {request.req_id} is saving with compression."
             #     )
-
+            logger.info(f"Compress = {request.save_spec.compress}")
             self.lmcache_engine.store(
                 token_ids,
                 mask=store_mask,

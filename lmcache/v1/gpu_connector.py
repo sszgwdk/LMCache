@@ -12,7 +12,8 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, TensorMemoryObj, BytesBufferMemoryObj
+from lmcache.v1.storage_backend.naive_serde.serde import Serializer
 
 if torch.cuda.is_available():
     # First Party
@@ -54,6 +55,19 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             token sequence.
         """
         raise NotImplementedError
+    
+    def serialize_from_gpu(self, start: int, end: int, serializer: Serializer = None, dtype=None, **kwargs) -> MemoryObj:
+        """
+        Serialize and compress data directly from GPU to CPU to avoid redundant
+        GPU-CPU-GPU transfers.
+
+        :param MemoryObj memory_obj: The memory object to store the data from GPU.
+        :param int start: The starting index of the data in the corresponding
+            token sequence.
+        :param int end: The ending index of the data in the corresponding
+            token sequence.
+        """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def batched_from_gpu(
@@ -76,14 +90,14 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
-    @abc.abstractmethod
-    def batched_to_gpu(
+    def batched_serialize_from_gpu(
         self,
-        memory_objs: Union[List[List[MemoryObj]], List[MemoryObj]],
         starts: List[int],
         ends: List[int],
+        serializer: Serializer = None,
+        dtype=None,
         **kwargs,
-    ):
+    ) -> List[MemoryObj]:
         """
         Batched store the data from the memory objects to GPU kv cache.
         Sub-classes should define the format of the kwargs.
@@ -308,6 +322,61 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
+    @_lmcache_nvtx_annotate
+    def serialize_from_gpu(self, start: int, end: int, serializer: Serializer = None, dtype=None, **kwargs):
+        """
+        Serialize and compress data directly from GPU to CPU to avoid redundant
+        GPU-CPU-GPU transfers.
+
+        :param int start: The starting index of the data in the corresponding token sequence.
+        :param int end: The ending index of the data in the corresponding token sequence.
+        :raises ValueError: If 'kvcaches' or 'slot_mapping' is not provided in kwargs.
+        """
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+
+        if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+            self.gpu_buffer = torch.empty(
+                self.get_shape(end - start),
+                dtype=dtype if dtype is not None else self.kvcaches[0].dtype,
+                device=self.kvcaches[0].device,
+            )
+
+        with torch.cuda.stream(self.store_stream):
+            assert self.gpu_buffer.device == self.kvcaches[0].device
+            tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+            lmc_ops.multi_layer_kv_transfer(
+                tmp_gpu_buffer,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.kvcaches[0].device,
+                self.page_buffer_size,
+                True,
+                self.use_mla,
+            )
+
+        # Serialize the data on GPU (avoiding GPU->CPU->GPU round trip)
+        if serializer:
+            memory_obj = serializer.serialize_tensor(tmp_gpu_buffer)
+        else:
+            raise ValueError("Serializer is not initialized.")
+
+        if self.use_mla:
+            memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
+            
+        return memory_obj
+
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
         with torch.cuda.stream(self.load_stream):
@@ -319,6 +388,13 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
+
+    def batched_serialize_from_gpu(self, starts, ends, serializer: Serializer = None, dtype=None, **kwargs):
+        memory_objs = []
+        for start, end in zip(starts, ends, strict=False):
+            memory_obj = self.serialize_from_gpu(start, end, serializer=serializer, dtype=dtype, **kwargs)
+            memory_objs.append(memory_obj)
+        return memory_objs
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2

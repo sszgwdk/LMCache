@@ -82,3 +82,38 @@ class CacheGenSerializer(Serializer):
         )
 
         return BytesBufferMemoryObj(output_dict.to_bytes())
+    
+    @_lmcache_nvtx_annotate
+    def serialize_tensor(self, tensor: torch.Tensor) -> BytesBufferMemoryObj:
+        """
+        Serialize a tensor to CACHEGEN_BINARY format.
+
+        Input:
+            tensor: the tensor to be serialized.
+
+        Returns:
+            BytesBufferMemoryObj: the serialized binary memory object.
+        """
+        assert tensor.is_cuda, "Tensor must be on GPU for serialization."
+
+        # Ensure key_bins and value_bins are on the same device as the tensor
+        if tensor.device != self.key_bins.device:
+            self.key_bins = self.key_bins.to(tensor.device)
+        if tensor.device != self.value_bins.device:
+            self.value_bins = self.value_bins.to(tensor.device)
+
+        # Reshape and permute the tensor
+        tensor = tensor.view(*tensor.shape[:-1], self.kv_shape[-2], self.kv_shape[-1])
+        tensor = tensor.permute([1, 0, 2, 3, 4])
+
+        # Serialize the tensor
+        ntokens = tensor.shape[2]
+        output_dict = encode_function(
+            tensor,
+            self.cachegen_config,
+            self.key_bins,
+            self.value_bins,
+            ntokens,
+        )
+
+        return BytesBufferMemoryObj(output_dict.to_bytes())

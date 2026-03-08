@@ -15,7 +15,7 @@ import asyncio
 import gc
 import multiprocessing
 import time
-
+import threading
 # Third Party
 import torch
 
@@ -51,6 +51,8 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+from lmcache.v1.storage_backend.naive_serde.cachegen_encoder import CacheGenSerializer
+from lmcache.v1.storage_backend.naive_serde.cachegen_decoder import CacheGenDeserializer
 
 logger = init_logger(__name__)
 
@@ -177,7 +179,13 @@ class LMCacheEngine:
                 event_manager=self.event_manager,
                 lmcache_worker=self.lmcache_worker,
             )
-
+        
+        self.serializer = None
+        self.deserializer = None
+        if metadata:
+             self.serializer = CacheGenSerializer(config, metadata)
+             self.deserializer = CacheGenDeserializer(config, metadata)
+        
         # HACK: remove this in the future
         # NOTE (Jiayi): This is currently used to support
         # dropping the kv cache from the buffer in PD backend
@@ -211,7 +219,12 @@ class LMCacheEngine:
         self.force_store_wait = config.extra_config and config.extra_config.get(
             "force_store_wait", False
         )
-
+        
+        # Compression statistics counters
+        self.compressed_stored_count = 0
+        self.decompressed_retrieved_count = 0
+        self.compression_stats_lock = threading.Lock()
+ 
         gc.collect()
         if not config.py_enable_gc:
             gc.disable()
@@ -300,6 +313,7 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        compress = kwargs.get("compress", False)
         for start, end, key in self.token_database.process_tokens(
             tokens,
             hashes,
@@ -310,43 +324,47 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             # Allocate the memory object
             num_tokens = end - start
-            kv_shape = self.gpu_connector.get_shape(num_tokens)
-            kv_dtype = self.metadata.kv_dtype
 
             # TODO (Jiayi): should be batched in the future
-            memory_obj = self.storage_manager.allocate(
-                kv_shape,
-                kv_dtype,
-                busy_loop=self.force_store_wait,
-                fmt=self.fmt,
-            )
-            if memory_obj is None:
-                logger.warning(
-                    "Local cpu memory under pressure so"
-                    " choosing to not store the KV cache."
+            if not compress:
+                kv_shape = self.gpu_connector.get_shape(num_tokens)
+                kv_dtype = self.metadata.kv_dtype
+                memory_obj = self.storage_manager.allocate(
+                    kv_shape,
+                    kv_dtype,
+                    busy_loop=self.force_store_wait,
+                    fmt=self.fmt,
                 )
-                break
+                if memory_obj is None:
+                    logger.warning(
+                        "Local cpu memory under pressure so"
+                        " choosing to not store the KV cache."
+                    )
+                    break
+                memory_objs.append(memory_obj)
+                tot_kv_size += memory_obj.get_size()
 
             starts.append(start)
             ends.append(end)
             keys.append(key)
-            memory_objs.append(memory_obj)
-            tot_kv_size += memory_obj.get_size()
             tot_token_num += num_tokens
 
-        # memory_objs might be empty, directly return to avoid sending tokens
-        if not memory_objs:
-            return
-
-        # 目前对于压缩卸载的实现，仍然是先从 GPU 拷贝到 CPU，再考虑压缩(还会回到 GPU 上执行量化压缩，效率很低)
-        # TODO(wk): 对于需要压缩保存的 block，直接在 GPU 端压缩后卸载存储到 CPU，避免多一次拷贝
-        self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        if compress:
+            memory_objs = self.gpu_connector.batched_serialize_from_gpu(starts, ends, self.serializer, self.metadata.kv_dtype, **kwargs)
+            # Update compression statistics
+            with self.compression_stats_lock:
+                self.compressed_stored_count += len(memory_objs)
+            logger.info(f"Compressed {len(memory_objs)} KV caches during store operation")
+        else:
+            # memory_objs might be empty, directly return to avoid sending tokens
+            if not memory_objs:
+                return
+            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
         offload_time += time.perf_counter() - t
 
         t = time.perf_counter()
 
         transfer_spec = kwargs.get("transfer_spec", None)
-        compress = kwargs.get("compress", False)
 
         self.storage_manager.batched_put(keys, memory_objs, transfer_spec=transfer_spec, compress=compress)
         put_time += time.perf_counter() - t
@@ -567,6 +585,20 @@ class LMCacheEngine:
         # RDMA is another example.
         if len(reordered_chunks) > 0:
             _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+            
+            # Count how many memory objects were decompressed during retrieval
+            decompressed_count = 0
+            for memory_obj in memory_objs:
+                # Check if the memory object was compressed (likely a BytesBufferMemoryObj)
+                from lmcache.v1.memory_management import BytesBufferMemoryObj
+                if isinstance(memory_obj, BytesBufferMemoryObj):
+                    decompressed_count += 1
+            
+            if decompressed_count > 0:
+                with self.compression_stats_lock:
+                    self.decompressed_retrieved_count += decompressed_count
+                logger.info(f"Decompressed {decompressed_count} KV caches during retrieve operation")
+
             self.gpu_connector.batched_to_gpu(
                 list(memory_objs), list(starts), list(ends), **kwargs
             )
@@ -1135,7 +1167,29 @@ class LMCacheEngine:
             else:
                 return 0
         return self._clear(tokens, locations, request_configs)
-
+    def get_compression_stats(self):
+        """
+        Get compression statistics.
+        
+        Returns:
+            dict: Dictionary containing compression statistics including:
+                - compressed_stored_count: Number of KV caches compressed during store operations
+                - decompressed_retrieved_count: Number of KV caches decompressed during retrieve operations
+        """
+        with self.compression_stats_lock:
+            stats = {
+                "compressed_stored_count": self.compressed_stored_count,
+                "decompressed_retrieved_count": self.decompressed_retrieved_count,
+            }
+        return stats
+ 
+    def reset_compression_stats(self):
+        """
+        Reset compression statistics counters to zero.
+        """
+        with self.compression_stats_lock:
+            self.compressed_stored_count = 0
+            self.decompressed_retrieved_count = 0
     def _clear(
         self,
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,

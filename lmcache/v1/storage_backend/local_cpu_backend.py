@@ -193,14 +193,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             #     self.cache_policy.update_on_hit(key, self.hot_cache)
             #     continue
             
-            # TODO(wk): 暂时不会走入该分支，即不会进行压缩存储
-            if compress:
-                # Compress
-                if self.serializer:
-                    compressed_obj = self.serializer.serialize(memory_obj)
-                    self.submit_put_task(key, compressed_obj)
-                    return
-
             self.submit_put_task(key, memory_obj)
 
     def get_blocking(
@@ -227,7 +219,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                      
                 #     self.hot_cache[key] = cpu_obj
             # TODO(wk): 是否需要 update_on_hit？
-            # self.cache_policy.update_on_hit(key, self.hot_cache)
+            self.cache_policy.update_on_hit(key, self.hot_cache)
 
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls

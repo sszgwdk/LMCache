@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import (
     Any,
     Callable,
+    cast,
     Dict,
     Generator,
     List,
@@ -35,6 +36,7 @@ from lmcache.v1.gpu_connector import (
 )
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
+    CompressedMemoryObj,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -43,6 +45,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     PagedTensorMemoryAllocator,
     TensorMemoryObj,
 )
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -205,6 +208,8 @@ class LMCacheEngine:
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         self.post_inited = False
+        self._cachegen_serializer = None
+        self._cachegen_deserializer = None
 
         # Whether to force store to wait if no CPU buffer is available
         self.force_store_wait = config.extra_config and config.extra_config.get(
@@ -264,6 +269,16 @@ class LMCacheEngine:
             return
 
         assert self.storage_manager is not None
+
+        if self._is_compressed_local_mode_enabled():
+            self._compressed_local_store(
+                tokens=tokens,
+                hashes=hashes,
+                offsets=offsets,
+                mask=mask,
+                **kwargs,
+            )
+            return
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -512,6 +527,9 @@ class LMCacheEngine:
             "gpu_connector is required for retrieve operation"
         )
 
+        if self._is_compressed_local_mode_enabled():
+            return self._compressed_local_retrieve(tokens=tokens, mask=mask, **kwargs)
+
         tot_kv_size = 0
         t = time.perf_counter()
 
@@ -587,6 +605,254 @@ class LMCacheEngine:
             tot_kv_size / 1024**3,
             onload_time * 1000,
             tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
+        )
+        return ret_mask
+
+    def _is_compressed_local_mode_enabled(self) -> bool:
+        if not self.config.enable_local_compressed_cpu_tier:
+            return False
+        local_cpu_backend = self._get_local_cpu_backend()
+        return local_cpu_backend is not None and local_cpu_backend.is_compressed_mode
+
+    def _get_local_cpu_backend(self) -> Optional[LocalCPUBackend]:
+        if self.storage_manager is None:
+            return None
+        backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
+        if backend is None or not isinstance(backend, LocalCPUBackend):
+            return None
+        return backend
+
+    def _get_cachegen_serde(self):
+        if self._cachegen_serializer is None or self._cachegen_deserializer is None:
+            # First Party
+            from lmcache.v1.storage_backend.naive_serde import CreateSerde
+
+            serializer, deserializer = CreateSerde("cachegen", self.metadata, self.config)
+            self._cachegen_serializer = serializer
+            self._cachegen_deserializer = deserializer
+        return self._cachegen_serializer, self._cachegen_deserializer
+
+    def _encode_gpu_chunk_to_compressed_obj(
+        self,
+        start: int,
+        end: int,
+        **kwargs,
+    ) -> tuple[CompressedMemoryObj, float]:
+        assert self.gpu_connector is not None
+        serializer, _ = self._get_cachegen_serde()
+
+        staging_obj = self.gpu_connector.export_staging_tensor(start, end, **kwargs)
+        if hasattr(self.gpu_connector, "store_stream"):
+            self.gpu_connector.store_stream.synchronize()
+        encode_start = time.perf_counter()
+        compressed_obj = serializer.serialize(staging_obj)
+        if not isinstance(compressed_obj, CompressedMemoryObj):
+            raise TypeError(
+                "CacheGen serializer in compressed local mode must return "
+                "CompressedMemoryObj"
+            )
+        encode_time_ms = (time.perf_counter() - encode_start) * 1000
+        return compressed_obj, encode_time_ms
+
+    def _decode_compressed_obj_to_gpu_chunk(
+        self,
+        compressed_obj: CompressedMemoryObj,
+    ) -> tuple[MemoryObj, float]:
+        _, deserializer = self._get_cachegen_serde()
+        decode_start = time.perf_counter()
+        decoded_obj = deserializer.deserialize(compressed_obj)
+        decode_time_ms = (time.perf_counter() - decode_start) * 1000
+        return decoded_obj, decode_time_ms
+
+    @torch.inference_mode()
+    def _compressed_local_store(
+        self,
+        tokens: Optional[Union[torch.Tensor, list[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> None:
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for compressed local store"
+        )
+
+        local_cpu_backend = self._get_local_cpu_backend()
+        assert local_cpu_backend is not None, (
+            "LocalCPUBackend is required in compressed local mode"
+        )
+
+        assert tokens is not None or hashes is not None, (
+            "Either 'tokens' or 'hashes' must be provided."
+        )
+        if mask is not None:
+            num_to_store_tokens = torch.sum(mask).item()
+        elif tokens is not None:
+            num_to_store_tokens = len(tokens)
+        else:
+            assert hashes is not None and offsets is not None
+            num_to_store_tokens = sum(offsets)
+            kwargs["slot_mapping"] = torch.tensor(
+                kwargs["slot_mapping"], dtype=torch.long, device="cuda"
+            )
+
+        monitor_req_id = self.stats_monitor.on_store_request(num_to_store_tokens)
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        keys: list[CacheEngineKey] = []
+        compressed_objs: list[CompressedMemoryObj] = []
+        tot_kv_size = 0
+        tot_token_num = 0
+        encode_time = 0.0
+        put_time = 0.0
+
+        for start, end, key in self.token_database.process_tokens(
+            tokens,
+            hashes,
+            offsets,
+            mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            compressed_obj, encode_ms = self._encode_gpu_chunk_to_compressed_obj(
+                start=start,
+                end=end,
+                **kwargs,
+            )
+            keys.append(key)
+            compressed_objs.append(compressed_obj)
+            tot_kv_size += compressed_obj.get_size()
+            tot_token_num += end - start
+            encode_time += encode_ms / 1000
+            self.stats_monitor.update_interval_gpu_encode_time_ms(encode_ms)
+
+        if not compressed_objs:
+            return
+
+        t_put = time.perf_counter()
+        transfer_spec = kwargs.get("transfer_spec", None)
+        local_cpu_backend.batched_submit_put_task(
+            keys,
+            cast(List[MemoryObj], compressed_objs),
+            transfer_spec=transfer_spec,
+        )
+        put_time = time.perf_counter() - t_put
+
+        for compressed_obj in compressed_objs:
+            compressed_obj.ref_count_down()
+
+        tot_time = encode_time + put_time
+        logger.info(
+            "Stored %d out of total %d tokens (compressed mode). size: %.4f gb, "
+            "cost %.4f ms, throughput: %.4f GB/s; encode_time: %.4f ms, "
+            "put_time: %.4f ms",
+            tot_token_num,
+            num_to_store_tokens,
+            tot_kv_size / 1024**3,
+            tot_time * 1000,
+            tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+            encode_time * 1000,
+            put_time * 1000,
+        )
+        self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+
+    @torch.inference_mode()
+    def _compressed_local_retrieve(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for compressed local retrieve"
+        )
+        assert self.storage_manager is not None
+
+        local_cpu_backend = self._get_local_cpu_backend()
+        assert local_cpu_backend is not None, (
+            "LocalCPUBackend is required in compressed local mode"
+        )
+
+        if mask is not None:
+            num_required_tokens = torch.sum(mask).item()
+        else:
+            num_required_tokens = len(tokens)
+        monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
+
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        decoded_chunks: list[tuple[CacheEngineKey, MemoryObj, int, int, CompressedMemoryObj]] = []
+        tot_kv_size = 0
+        t = time.perf_counter()
+        decode_time = 0.0
+
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+
+            if not local_cpu_backend.contains(key):
+                break
+
+            compressed_obj = local_cpu_backend.get_blocking(key)
+            if compressed_obj is None:
+                break
+            if not isinstance(compressed_obj, CompressedMemoryObj):
+                compressed_obj.ref_count_down()
+                raise TypeError(
+                    "Compressed local retrieve expects CompressedMemoryObj "
+                    "from LocalCPUBackend"
+                )
+
+            try:
+                decoded_obj, decode_ms = self._decode_compressed_obj_to_gpu_chunk(
+                    compressed_obj
+                )
+            except Exception:
+                compressed_obj.ref_count_down()
+                break
+            decode_time += decode_ms / 1000
+            self.stats_monitor.update_interval_gpu_decode_time_ms(decode_ms)
+
+            decoded_chunks.append((key, decoded_obj, start, end, compressed_obj))
+            ret_mask[start:end] = True
+            tot_kv_size += decoded_obj.get_size()
+
+        if decoded_chunks:
+            _, decoded_objs, starts, ends, _ = zip(*decoded_chunks, strict=False)
+            self.gpu_connector.batched_to_gpu(
+                list(decoded_objs),
+                list(starts),
+                list(ends),
+                **kwargs,
+            )
+
+        for key, _, _, _, compressed_obj in decoded_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                self.storage_manager.remove(key)
+            compressed_obj.ref_count_down()
+
+        onload_time = time.perf_counter() - t
+        retrieved_tokens = torch.sum(ret_mask)
+        self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        logger.info(
+            "Retrieved %d out of %d required tokens (from %d total tokens) "
+            "(compressed mode). size: %.4f gb, cost %.4f ms, throughput: %.4f GB/s; "
+            "decode_time: %.4f ms",
+            retrieved_tokens,
+            num_required_tokens,
+            len(tokens),
+            tot_kv_size / 1024**3,
+            onload_time * 1000,
+            tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
+            decode_time * 1000,
         )
         return ret_mask
 

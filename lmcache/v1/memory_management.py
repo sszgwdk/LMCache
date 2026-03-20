@@ -615,7 +615,6 @@ class BytesBufferMemoryObj(MemoryObj):
         """
         return not self.is_pinned
 
-
 class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def allocate(
@@ -656,7 +655,7 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
         :param int batch_size: The number of tensors to allocate.
         :param MemoryFormat fmt: The format of the memory to allocate.
 
-        :return: A lisf of MemoryObjs wrapping the allocated memory.
+        :return: A list of MemoryObjs wrapping the allocated memory.
             Returns None if the allocation failed.
 
         :rtype: Optional[List[MemoryObj]]
@@ -687,9 +686,10 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
     ):
         """
         Frees the memory allocated for the given list of MemoryObjs.
+        Note that this function shouldn't be explicitly called.
+        Instead, use `ref_count_down` to decrease ref count.
 
-        :param List[MemoryObj] memory_objs: The list of MemoryObjs
-            to free.
+        :param List[MemoryObj] memory_objs: The list of MemoryObjs to free.
         """
         raise NotImplementedError
 
@@ -708,6 +708,268 @@ class MemoryAllocatorInterface(metaclass=abc.ABCMeta):
             True if everything is fine otherwise False
         """
         return True
+
+
+class CompressedMemoryObj(MemoryObj):
+    """Compressed payload stored in pooled pinned CPU uint8 buffers."""
+
+    monitor = LMCStatsMonitor.GetOrCreate()
+
+    def __init__(
+        self,
+        raw_data: torch.Tensor,
+        metadata: MemoryObjMetadata,
+        parent_allocator: Optional["CompressedMemoryAllocator"],
+        backing_allocation: TensorMemoryObj,
+    ):
+        assert raw_data.dtype == torch.uint8, (
+            "CompressedMemoryObj raw_data must be uint8 tensor"
+        )
+        super().__init__(metadata)
+        self.raw_data = raw_data
+        self.parent_allocator = parent_allocator
+        self.backing_allocation = backing_allocation
+        self.valid = True
+        self.lock = threading.Lock()
+
+    def invalidate(self):
+        self.valid = False
+
+    def is_valid(self):
+        return self.valid
+
+    def get_size(self) -> int:
+        with self.lock:
+            return int(self.meta.shape[0])
+
+    def get_shape(self) -> torch.Size:
+        with self.lock:
+            return self.meta.shape
+
+    def get_dtype(self) -> Optional[torch.dtype]:
+        return torch.uint8
+
+    def get_memory_format(self) -> MemoryFormat:
+        with self.lock:
+            return self.meta.fmt
+
+    def get_physical_size(self) -> int:
+        return self.meta.phy_size
+
+    def pin(self) -> bool:
+        with self.lock:
+            if self.meta.pin_count == 0:
+                CompressedMemoryObj.monitor.update_pinned_memory_objs_count(1)
+            self.meta.pin_count += 1
+            return True
+
+    def unpin(self) -> bool:
+        with self.lock:
+            self.meta.pin_count -= 1
+
+            if self.meta.pin_count == 0:
+                CompressedMemoryObj.monitor.update_pinned_memory_objs_count(-1)
+
+            if self.meta.pin_count <= 0 and self.meta.ref_count <= 0:
+                if self.parent_allocator is not None:
+                    self.parent_allocator.free(self)
+                else:
+                    logger.error(
+                        "Parent allocator is None when trying to free "
+                        "CompressedMemoryObj"
+                    )
+
+            if self.meta.pin_count < 0:
+                logger.warning(
+                    "Pin count of CompressedMemoryObj %s is negative: %d. "
+                    "Resetting to 0.",
+                    self.meta.address,
+                    self.meta.pin_count,
+                )
+                self.meta.pin_count = 0
+            return True
+
+    def ref_count_up(self):
+        with self.lock:
+            self.meta.ref_count += 1
+
+    def ref_count_down(self):
+        with self.lock:
+            self.meta.ref_count -= 1
+            if self.meta.ref_count < 0:
+                logger.warning(
+                    "Ref count of CompressedMemoryObj %s is negative: %d. "
+                    "Resetting to 0.",
+                    self.meta.address,
+                    self.meta.ref_count,
+                )
+                self.meta.ref_count = 0
+
+            if self.meta.ref_count == 0 and self.meta.pin_count == 0:
+                if self.parent_allocator is not None:
+                    self.parent_allocator.free(self)
+                else:
+                    logger.error(
+                        "Parent allocator is None when trying to free "
+                        "CompressedMemoryObj"
+                    )
+
+    def get_ref_count(self) -> int:
+        with self.lock:
+            return self.meta.ref_count
+
+    def get_num_tokens(self) -> int:
+        # compressed payload does not map to token count in stage 1.
+        return 1
+
+    @property
+    def metadata(self) -> MemoryObjMetadata:
+        with self.lock:
+            return self.meta
+
+    @property
+    def tensor(self) -> Optional[torch.Tensor]:
+        if not self.valid:
+            logger.warning("Trying to access an invalidated CompressedMemoryObj")
+            return None
+        size = self.get_size()
+        return self.raw_data[:size]
+
+    @property
+    def byte_array(self) -> bytes:
+        size = self.get_size()
+        ptr = self.raw_data.data_ptr()
+        ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
+        byte_array = (ctypes.c_ubyte * size).from_address(
+            ctypes.addressof(ubyte_ptr.contents)
+        )
+        return memoryview(byte_array)
+
+    @property
+    def data_ptr(self) -> int:
+        return self.raw_data.data_ptr()
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.metadata.pin_count > 0
+
+    @property
+    def can_evict(self) -> bool:
+        return not self.is_pinned and self.get_ref_count() == 1
+
+
+class CompressedMemoryAllocator(MemoryAllocatorInterface):
+    """Variable-length allocator over pooled pinned CPU uint8 memory."""
+
+    def __init__(
+        self,
+        total_size: int,
+        align_bytes: int = 64,
+        numa_mapping: Optional[NUMAMapping] = None,
+    ):
+        assert total_size >= 0, "total_size must be >= 0"
+        assert align_bytes > 0, "align_bytes must be > 0"
+
+        self.total_size = total_size
+        self.align_bytes = align_bytes
+        self.numa_mapping = numa_mapping
+        self._unregistered = False
+        self.buffer = _allocate_cpu_memory(total_size, self.numa_mapping)
+        self.allocator = TensorMemoryAllocator(self.buffer, align_bytes=align_bytes)
+
+    def _extract_requested_size(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+    ) -> int:
+        if not isinstance(shape, torch.Size):
+            shape = torch.Size(shape)
+        assert len(shape) > 0, "shape must have at least one dimension"
+        return int(shape[0])
+
+    @_lmcache_nvtx_annotate
+    def allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        fmt: MemoryFormat = MemoryFormat.BINARY,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[CompressedMemoryObj]:
+        requested_size = self._extract_requested_size(shape)
+        backing_allocation = self.allocator.allocate(
+            torch.Size([requested_size]),
+            torch.uint8,
+            fmt=fmt,
+            allocator_type=allocator_type,
+        )
+        if backing_allocation is None:
+            logger.debug(
+                "CompressedMemoryAllocator allocation failed: requested_size=%d",
+                requested_size,
+            )
+            return None
+
+        return CompressedMemoryObj(
+            raw_data=backing_allocation.raw_data,
+            metadata=backing_allocation.metadata,
+            parent_allocator=self,
+            backing_allocation=backing_allocation,
+        )
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate(
+        self,
+        shape: Union[torch.Size, Tuple[int, ...]],
+        dtype: Optional[torch.dtype],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.BINARY,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[List[CompressedMemoryObj]]:
+        memory_objs: list[CompressedMemoryObj] = []
+        for _ in range(batch_size):
+            obj = self.allocate(shape, dtype, fmt=fmt, allocator_type=allocator_type)
+            if obj is None:
+                for allocated_obj in memory_objs:
+                    self.free(allocated_obj, allocator_type=allocator_type)
+                return None
+            memory_objs.append(obj)
+        return memory_objs
+
+    @_lmcache_nvtx_annotate
+    def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):
+        if not isinstance(memory_obj, CompressedMemoryObj):
+            raise ValueError("CompressedMemoryAllocator only frees CompressedMemoryObj")
+
+        if not memory_obj.is_valid():
+            return
+
+        self.allocator.free(memory_obj.backing_allocation, allocator_type=allocator_type)
+        memory_obj.invalidate()
+
+    @_lmcache_nvtx_annotate
+    def batched_free(
+        self,
+        memory_objs: List[MemoryObj],
+        allocator_type: Optional[str] = None,
+        update_stats: bool = True,
+    ):
+        for memory_obj in memory_objs:
+            self.free(memory_obj, allocator_type=allocator_type)
+
+    def memcheck(self):
+        return self.allocator.memcheck()
+
+    def close(self):
+        if self._unregistered:
+            return
+        _free_cpu_memory(
+            self.buffer,
+            size=self.total_size,
+            numa_mapping=self.numa_mapping,
+        )
+        self._unregistered = True
+
+    def __str__(self):
+        return "CompressedMemoryAllocator"
 
 
 class TensorMemoryAllocator(MemoryAllocatorInterface):

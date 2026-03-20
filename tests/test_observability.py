@@ -266,3 +266,12 @@ def test_zero_division_protection(stats_monitor):
     stats = stats_monitor.get_stats_and_clear()
     assert stats.retrieve_hit_rate == 0
     assert stats.lookup_hit_rate == 0
+
+
+def test_compressed_tier_and_gpu_codec_metrics(stats_monitor):
+    stats_monitor.update_interval_gpu_encode_time_ms(1.25)
+    stats_monitor.update_interval_gpu_decode_time_ms(0.75)
+
+    stats = stats_monitor.get_stats_and_clear()
+    assert stats.interval_gpu_encode_time_ms == [1.25]
+    assert stats.interval_gpu_decode_time_ms == [0.75]

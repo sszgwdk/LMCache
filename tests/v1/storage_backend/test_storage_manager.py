@@ -30,6 +30,7 @@ import torch
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
+from lmcache.v1.memory_management import AdHocMemoryAllocator, MemoryFormat
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
@@ -316,3 +317,22 @@ class TestStorageManagerPrefetchCallback:
         # (no remaining chunks in current tier, no subsequent tiers)
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
+
+
+def test_batched_put_rejects_binary_memory_obj(storage_manager):
+    allocator = AdHocMemoryAllocator(device="cpu")
+    try:
+        mem_obj = allocator.allocate(
+            torch.Size([64]),
+            torch.uint8,
+            fmt=MemoryFormat.BINARY,
+        )
+        assert mem_obj is not None
+
+        with pytest.raises(TypeError, match="Compressed payload objects"):
+            storage_manager.batched_put(
+                keys=[],
+                memory_objs=[mem_obj],
+            )
+    finally:
+        allocator.close()

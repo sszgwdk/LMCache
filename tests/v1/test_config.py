@@ -136,3 +136,51 @@ def test_get_lookup_server_worker_ids(use_mla):
     assert lookup_server_worker_ids == [0, 3, 6]
 
     del os.environ["LMCACHE_LOOKUP_SERVER_WORKER_IDS"]
+
+
+def test_local_compressed_cpu_tier_config_validation_success():
+    config = LMCacheEngineConfig.from_defaults(
+        enable_local_compressed_cpu_tier=True,
+        local_cpu=True,
+        max_local_cpu_size=0.01,
+    )
+    config.validate()
+    assert config.local_cpu is False
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"use_layerwise": True},
+        {"enable_blending": True},
+        {"max_local_cpu_size": 0.0},
+        {"enable_p2p": True},
+        {"local_disk": "/tmp/lmcache-disk"},
+        {"max_local_disk_size": 1.0},
+        {"remote_url": "redis://127.0.0.1:6379"},
+        {"enable_pd": True, "pd_role": "sender", "pd_buffer_size": 1},
+        {"weka_path": "/tmp/weka"},
+        {"gds_path": "/tmp/gds"},
+        {"external_backends": ["dummy_backend"]},
+        {"extra_config": {"enable_nixl_storage": True}},
+    ],
+)
+def test_local_compressed_cpu_tier_config_validation_failure(override):
+    kwargs = {
+        "enable_local_compressed_cpu_tier": True,
+        "max_local_cpu_size": 0.01,
+    }
+    kwargs.update(override)
+    config = LMCacheEngineConfig.from_defaults(**kwargs)
+    with pytest.raises(AssertionError):
+        config.validate()
+
+
+def test_local_compressed_cpu_tier_config_normalizes_remote_serde():
+    config = LMCacheEngineConfig.from_defaults(
+        enable_local_compressed_cpu_tier=True,
+        max_local_cpu_size=0.01,
+        remote_serde="naive",
+    )
+    config.validate()
+    assert config.remote_serde == "cachegen"

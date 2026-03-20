@@ -486,6 +486,21 @@ def _init_lmcache_engine(
     kv_dtype = get_kv_cache_torch_dtype(cache_config.cache_dtype, model_config.dtype)
 
     use_mla = mla_enabled(model_config)
+
+    if lmcache_config.enable_local_compressed_cpu_tier:
+        if use_mla:
+            raise ValueError(
+                "Local compressed CPU hot-tier does not support MLA in stage 1"
+            )
+        if lmcache_config.use_layerwise:
+            raise ValueError(
+                "Local compressed CPU hot-tier does not support layerwise in stage 1"
+            )
+        if lmcache_config.enable_blending:
+            raise ValueError(
+                "Local compressed CPU hot-tier does not support blending in stage 1"
+            )
+
     if use_mla and (
         lmcache_config.remote_serde != "naive"
         and lmcache_config.remote_serde is not None

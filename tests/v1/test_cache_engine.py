@@ -20,6 +20,7 @@ from lmcache.utils import (
 from lmcache.v1.cache_engine import LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
+from lmcache.v1.memory_management import CompressedMemoryObj
 
 # Local
 from .utils import (
@@ -110,6 +111,146 @@ def test_paged_same_retrieve_store(autorelease_v1):
     length = torch.sum(ret_mask)
     assert length == num_tokens
     check_paged_kv_cache_equal(retrieved_cache, kv_cache, slot_mapping)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_compressed_local_hot_path_store_retrieve_pin_unpin(autorelease_v1):
+    device = "cuda"
+    fmt = "vllm"
+    chunk_size = 256
+    num_tokens = chunk_size * 2
+    num_blocks = 1000
+    block_size = 16
+    dtype = torch.bfloat16
+    kv_shape = (32, 2, chunk_size, 8, 128)
+
+    connector = create_gpu_connector(1024, 32)
+    tokens = generate_tokens(num_tokens, device)
+    kv_cache = generate_kv_cache_paged_list_tensors(
+        num_blocks, device, block_size, dtype
+    )
+    retrieved_cache = generate_kv_cache_paged_list_tensors(
+        num_blocks, device, block_size, dtype
+    )
+    original_retrieved_cache = deepcopy(retrieved_cache)
+
+    slot_mapping = random.sample(range(0, num_blocks * block_size), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, device=device)
+
+    cfg = LMCacheEngineConfig.from_defaults(
+        chunk_size=chunk_size,
+        local_cpu=False,
+        max_local_cpu_size=0.5,
+        enable_local_compressed_cpu_tier=True,
+        lmcache_instance_id="test",
+    )
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        )
+    )
+
+    engine.store(tokens=tokens, kvcaches=kv_cache, slot_mapping=slot_mapping)
+    recover_engine_states(engine)
+
+    assert engine.lookup(tokens, search_range=["LocalCPUBackend"]) == num_tokens
+
+    local_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    assert len(local_backend.hot_cache) > 0
+    assert all(
+        isinstance(memory_obj, CompressedMemoryObj)
+        for memory_obj in local_backend.hot_cache.values()
+    )
+
+    ret_mask = engine.retrieve(
+        tokens=tokens,
+        kvcaches=retrieved_cache,
+        slot_mapping=slot_mapping,
+    )
+    recover_engine_states(engine)
+
+    assert torch.sum(ret_mask) == num_tokens
+    with pytest.raises(AssertionError):
+        check_paged_kv_cache_equal(
+            retrieved_cache,
+            original_retrieved_cache,
+            slot_mapping,
+        )
+
+    lookup_id = "compressed-mode-lookup"
+    assert (
+        engine.lookup(
+            tokens=tokens,
+            search_range=["LocalCPUBackend"],
+            lookup_id=lookup_id,
+            pin=True,
+        )
+        == num_tokens
+    )
+    assert any(memory_obj.is_pinned for memory_obj in local_backend.hot_cache.values())
+
+    engine.lookup_unpin(lookup_id)
+    assert all(
+        not memory_obj.is_pinned for memory_obj in local_backend.hot_cache.values()
+    )
+    assert local_backend.memory_allocator.memcheck()
+
+    stats = engine.stats_monitor.get_stats_and_clear()
+    assert len(stats.interval_gpu_encode_time_ms) > 0
+    assert len(stats.interval_gpu_decode_time_ms) > 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_tensor_mode_hot_path_unchanged(autorelease_v1):
+    device = "cuda"
+    fmt = "vllm"
+    chunk_size = 256
+    num_tokens = chunk_size
+    num_blocks = 512
+    block_size = 16
+    dtype = torch.bfloat16
+    kv_shape = (32, 2, chunk_size, 8, 128)
+
+    connector = create_gpu_connector(1024, 32)
+    tokens = generate_tokens(num_tokens, device)
+    kv_cache = generate_kv_cache_paged_list_tensors(
+        num_blocks, device, block_size, dtype
+    )
+    slot_mapping = random.sample(range(0, num_blocks * block_size), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping, device=device)
+
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=chunk_size, remote_url=None)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(fmt, kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        )
+    )
+
+    engine.store(tokens=tokens, kvcaches=kv_cache, slot_mapping=slot_mapping)
+    recover_engine_states(engine)
+
+    assert engine.lookup(tokens, search_range=["LocalCPUBackend"]) == num_tokens
+    local_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    assert any(
+        not isinstance(memory_obj, CompressedMemoryObj)
+        for memory_obj in local_backend.hot_cache.values()
+    )
 
 
 @pytest.mark.parametrize("fmt", ["vllm"])

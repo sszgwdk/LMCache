@@ -13,6 +13,7 @@ from lmcache.v1.cache_controller.message import BatchedKVOperationMsg, OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     AdHocMemoryAllocator,
+    CompressedMemoryObj,
     MemoryFormat,
     MemoryObj,
 )
@@ -42,7 +43,11 @@ class MockLMCacheWorker:
 
 
 def create_test_config(
-    local_cpu: bool = True, use_layerwise: bool = False, enable_blending: bool = False
+    local_cpu: bool = True,
+    use_layerwise: bool = False,
+    enable_blending: bool = False,
+    max_local_cpu_size: float = 0.1,
+    enable_local_compressed_cpu_tier: bool = False,
 ):
     """Create a test configuration for LocalCPUBackend."""
     config = LMCacheEngineConfig.from_defaults(
@@ -50,6 +55,8 @@ def create_test_config(
         local_cpu=local_cpu,
         use_layerwise=use_layerwise,
         enable_blending=enable_blending,
+        max_local_cpu_size=max_local_cpu_size,
+        enable_local_compressed_cpu_tier=enable_local_compressed_cpu_tier,
         lmcache_instance_id="test_instance",
     )
     return config
@@ -79,6 +86,17 @@ def local_cpu_backend_disabled(memory_allocator):
     """Create a LocalCPUBackend with local_cpu disabled."""
     config = create_test_config(local_cpu=False)
     return LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+
+
+@pytest.fixture
+def local_cpu_backend_compressed(lmcache_engine_metadata):
+    """Create a LocalCPUBackend in compressed mode for testing."""
+    config = create_test_config(
+        local_cpu=False,
+        max_local_cpu_size=0.01,
+        enable_local_compressed_cpu_tier=True,
+    )
+    return LocalCPUBackend(config=config, metadata=lmcache_engine_metadata)
 
 
 class TestLocalCPUBackend:
@@ -512,3 +530,89 @@ class TestLocalCPUBackend:
         local_cpu_backend.remove(key)
         assert memory_obj.get_ref_count() == initial_ref_count + 1
         local_cpu_backend.memory_allocator.close()
+
+    def test_compressed_mode_put_get_pin_unpin_remove_clear(
+        self, local_cpu_backend_compressed
+    ):
+        key1 = create_test_key("cmp_key_1")
+        key2 = create_test_key("cmp_key_2")
+
+        mem_obj1 = local_cpu_backend_compressed.allocate_compressed(128)
+        mem_obj2 = local_cpu_backend_compressed.allocate_compressed(96)
+        assert mem_obj1 is not None
+        assert mem_obj2 is not None
+        assert isinstance(mem_obj1, CompressedMemoryObj)
+
+        local_cpu_backend_compressed.submit_put_task(key1, mem_obj1)
+        local_cpu_backend_compressed.submit_put_task(key2, mem_obj2)
+
+        assert local_cpu_backend_compressed.contains(key1)
+        fetched = local_cpu_backend_compressed.get_blocking(key1)
+        assert fetched is not None
+        assert isinstance(fetched, CompressedMemoryObj)
+
+        assert local_cpu_backend_compressed.pin(key1)
+        assert fetched.is_pinned
+        assert local_cpu_backend_compressed.unpin(key1)
+        assert not fetched.is_pinned
+
+        assert local_cpu_backend_compressed.remove(key1)
+        assert not local_cpu_backend_compressed.contains(key1)
+
+        # Release the caller-side ref so key2 can be evicted by clear().
+        mem_obj2.ref_count_down()
+        cleared_tokens = local_cpu_backend_compressed.clear()
+        assert cleared_tokens >= 1
+        assert len(local_cpu_backend_compressed.hot_cache) == 0
+
+        local_cpu_backend_compressed.close()
+
+    def test_compressed_mode_rejects_uncompressed_put(self, local_cpu_backend_compressed):
+        key = create_test_key("cmp_reject_tensor")
+        tensor_obj = create_test_memory_obj()
+
+        with pytest.raises(TypeError):
+            local_cpu_backend_compressed.submit_put_task(key, tensor_obj)
+
+        local_cpu_backend_compressed.close()
+
+    def test_compressed_mode_allocate_guards(self, local_cpu_backend_compressed):
+        shape = torch.Size([2, 16, 8, 128])
+        dtype = torch.bfloat16
+
+        with pytest.raises(RuntimeError):
+            local_cpu_backend_compressed.allocate(shape, dtype)
+
+        with pytest.raises(RuntimeError):
+            local_cpu_backend_compressed.batched_allocate(shape, dtype, 2)
+
+        allocated = local_cpu_backend_compressed.batched_allocate_compressed(64, 2)
+        assert allocated is not None
+        assert len(allocated) == 2
+        assert all(isinstance(obj, CompressedMemoryObj) for obj in allocated)
+
+        local_cpu_backend_compressed.close()
+
+    def test_compressed_mode_init_rejects_mla(self, lmcache_engine_metadata):
+        config = create_test_config(
+            local_cpu=False,
+            max_local_cpu_size=0.01,
+            enable_local_compressed_cpu_tier=True,
+        )
+        lmcache_engine_metadata.use_mla = True
+
+        with pytest.raises(AssertionError, match="does not support MLA"):
+            LocalCPUBackend(config=config, metadata=lmcache_engine_metadata)
+
+    def test_compressed_mode_init_rejects_invalid_serde(
+        self, lmcache_engine_metadata
+    ):
+        config = create_test_config(
+            local_cpu=False,
+            max_local_cpu_size=0.01,
+            enable_local_compressed_cpu_tier=True,
+        )
+        config.remote_serde = "custom_serde"
+
+        with pytest.raises(AssertionError, match="only supports cachegen serde"):
+            LocalCPUBackend(config=config, metadata=lmcache_engine_metadata)

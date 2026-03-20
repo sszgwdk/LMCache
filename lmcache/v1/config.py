@@ -29,11 +29,11 @@ def _parse_local_disk(local_disk) -> Optional[str]:
 
 
 def _to_int_list(
-    value: Optional[Union[str, int, list[Any]]],
+    value: Optional[Union[str, int, list[Any], tuple[Any, ...]]],
 ) -> Optional[list[int]]:
     if value is None:
         return None
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [int(x) for x in value]
     if isinstance(value, int):
         return [value]
@@ -406,6 +406,12 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # Local compressed CPU hot-tier (stage 1)
+    "enable_local_compressed_cpu_tier": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "script_allowed_imports": {
         "type": Optional[list[str]],
         "default": None,
@@ -615,6 +621,58 @@ def _validate_config(self):
         assert self.extra_config.get("nixl_pool_size") is not None
         assert self.nixl_buffer_size is not None
         assert self.nixl_buffer_device is not None
+
+    if self.enable_local_compressed_cpu_tier:
+        if self.local_cpu:
+            logger.warning(
+                "Automatically setting local_cpu=False because "
+                "enable_local_compressed_cpu_tier=True and the two hot tiers "
+                "must not coexist"
+            )
+            self.local_cpu = False
+
+        assert not self.use_layerwise, (
+            "Local compressed CPU hot-tier does not support use_layerwise in stage 1"
+        )
+        assert not self.enable_blending, (
+            "Local compressed CPU hot-tier does not support blending in stage 1"
+        )
+        assert self.max_local_cpu_size > 0, (
+            "max_local_cpu_size must be > 0 when "
+            "enable_local_compressed_cpu_tier=True"
+        )
+        assert not self.enable_p2p, (
+            "Local compressed CPU hot-tier does not support p2p in stage 1"
+        )
+        assert self.local_disk is None and self.max_local_disk_size <= 0, (
+            "Local compressed CPU hot-tier does not support local_disk in stage 1"
+        )
+        assert self.remote_url is None, (
+            "Local compressed CPU hot-tier does not support remote backend in stage 1"
+        )
+        assert self.weka_path is None and self.gds_path is None, (
+            "Local compressed CPU hot-tier only supports LocalCPUBackend in stage 1"
+        )
+        assert not self.enable_pd, (
+            "Local compressed CPU hot-tier does not support PD mode in stage 1"
+        )
+        assert not self.external_backends, (
+            "Local compressed CPU hot-tier does not support external backends in "
+            "stage 1"
+        )
+        assert not enable_nixl_storage, (
+            "Local compressed CPU hot-tier does not support nixl storage backend in "
+            "stage 1"
+        )
+        assert self.remote_serde in (None, "naive", "cachegen"), (
+            "Local compressed CPU hot-tier only supports cachegen serde in stage 1"
+        )
+        if self.remote_serde != "cachegen":
+            logger.warning(
+                "Automatically setting remote_serde='cachegen' because "
+                "enable_local_compressed_cpu_tier=True"
+            )
+            self.remote_serde = "cachegen"
 
     return self
 

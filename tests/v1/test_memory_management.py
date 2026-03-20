@@ -6,6 +6,8 @@ import torch
 # First Party
 from lmcache.v1.memory_management import (
     BytesBufferMemoryObj,
+    CompressedMemoryAllocator,
+    CompressedMemoryObj,
     GPUMemoryAllocator,
     HostMemoryAllocator,
     MemoryFormat,
@@ -270,3 +272,97 @@ def test_mixed_alloc(alloc_cls):
     assert len(data1.byte_array) == 512
 
     allocator.close()
+
+
+def test_compressed_memory_obj_lifecycle():
+    allocator = CompressedMemoryAllocator(total_size=512, align_bytes=64)
+    try:
+        mem_obj = allocator.allocate([128], dtype=None, fmt=MemoryFormat.BINARY)
+        assert isinstance(mem_obj, CompressedMemoryObj)
+        assert mem_obj is not None
+        assert mem_obj.is_valid()
+        assert mem_obj.get_size() == 128
+        assert mem_obj.get_physical_size() >= 128
+        assert mem_obj.can_evict
+
+        mem_obj.pin()
+        assert mem_obj.is_pinned
+        assert not mem_obj.can_evict
+
+        mem_obj.unpin()
+        assert not mem_obj.is_pinned
+        assert mem_obj.can_evict
+
+        mem_obj.ref_count_up()
+        assert mem_obj.get_ref_count() == 2
+        mem_obj.ref_count_down()
+        assert mem_obj.get_ref_count() == 1
+
+        mem_obj.ref_count_down()
+        assert not mem_obj.is_valid()
+        assert allocator.memcheck()
+    finally:
+        allocator.close()
+
+
+def test_compressed_allocator_variable_length_alloc_free():
+    allocator = CompressedMemoryAllocator(total_size=1024, align_bytes=64)
+    try:
+        obj1 = allocator.allocate([100], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj1 is not None
+        obj1_address = obj1.metadata.address
+
+        obj2 = allocator.allocate([180], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj2 is not None
+        assert obj2.metadata.address > obj1_address
+
+        obj1.ref_count_down()
+
+        # First-fit variable-length allocator should reuse the freed head block.
+        obj3 = allocator.allocate([96], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj3 is not None
+        assert obj3.metadata.address == obj1_address
+
+        obj2.ref_count_down()
+        obj3.ref_count_down()
+        assert allocator.memcheck()
+    finally:
+        allocator.close()
+
+
+def test_compressed_allocator_out_of_capacity():
+    allocator = CompressedMemoryAllocator(total_size=256, align_bytes=64)
+    try:
+        obj1 = allocator.allocate([200], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj1 is not None
+
+        obj2 = allocator.allocate([200], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj2 is None
+
+        # Request larger than max bucket must fail as well.
+        obj3 = allocator.allocate([300], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj3 is None
+
+        obj1.ref_count_down()
+        assert allocator.memcheck()
+    finally:
+        allocator.close()
+
+
+def test_compressed_allocator_coalescing_reuse():
+    allocator = CompressedMemoryAllocator(total_size=512, align_bytes=64)
+    try:
+        obj1 = allocator.allocate([100], dtype=None, fmt=MemoryFormat.BINARY)
+        obj2 = allocator.allocate([100], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj1 is not None
+        assert obj2 is not None
+
+        obj1.ref_count_down()
+        obj2.ref_count_down()
+
+        # Two adjacent freed blocks should be coalesced and satisfy a larger request.
+        obj3 = allocator.allocate([192], dtype=None, fmt=MemoryFormat.BINARY)
+        assert obj3 is not None
+        obj3.ref_count_down()
+    finally:
+        allocator.close()

@@ -12,7 +12,12 @@ from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 
 if torch.cuda.is_available():
     # First Party
@@ -22,6 +27,12 @@ logger = init_logger(__name__)
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
+    def export_staging_tensor(self, start: int, end: int, **kwargs) -> MemoryObj:
+        """Export a contiguous GPU staging tensor from paged KV cache."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support export_staging_tensor()."
+        )
+
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         # FIXME (Yihua): We shouldn't put start and end here since
@@ -185,6 +196,47 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         return self.kv_cache_pointers_on_gpu[idx]
 
     @_lmcache_nvtx_annotate
+    def export_staging_tensor(self, start: int, end: int, **kwargs) -> MemoryObj:
+        """Export paged KV into a contiguous GPU tensor for CacheGen encode."""
+        if self.use_mla:
+            raise RuntimeError(
+                "Stage-1 GPU staging export does not support MLA. "
+                "Use the standard paged KV path."
+            )
+
+        if end <= start:
+            raise ValueError(f"Invalid range [{start}, {end}) for staging export")
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None, (
+            "kvcaches should be provided in kwargs or initialized beforehand."
+        )
+
+        num_tokens = end - start
+        shape = self.get_shape(num_tokens)
+        dtype = self.kvcaches[0].dtype
+        device = self.kvcaches[0].device
+        staging_tensor = torch.empty(shape, dtype=dtype, device=device)
+
+        staging_memory_obj = TensorMemoryObj(
+            raw_data=staging_tensor,
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=staging_tensor.data_ptr(),
+                phy_size=staging_tensor.numel() * staging_tensor.element_size(),
+                ref_count=1,
+                pin_count=0,
+                fmt=MemoryFormat.KV_2LTD,
+            ),
+            parent_allocator=None,
+        )
+
+        self.from_gpu(staging_memory_obj, start, end, **kwargs)
+        staging_memory_obj.metadata.fmt = MemoryFormat.KV_2LTD
+        return staging_memory_obj
+
+    @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
@@ -326,6 +378,12 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
 
 class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
+    def export_staging_tensor(self, start: int, end: int, **kwargs) -> MemoryObj:
+        raise RuntimeError(
+            "Stage-1 GPU staging export does not support layerwise/blending "
+            "connectors."
+        )
+
     def __init__(
         self,
         hidden_dim_size: int,
@@ -785,6 +843,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 gpu_buffer_size, device=self.device
             )
 
+    def export_staging_tensor(self, start: int, end: int, **kwargs) -> MemoryObj:
+        raise RuntimeError(
+            "Stage-1 GPU staging export does not support layerwise paged "
+            "connectors."
+        )
+
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
 
@@ -1110,6 +1174,12 @@ class SGLangGPUConnector(GPUConnectorInterface):
         self.page_buffer_size = kv_caches[0].shape[0]
         return self.kv_cache_pointers_on_gpu[idx]
 
+    def export_staging_tensor(self, start: int, end: int, **kwargs) -> MemoryObj:
+        raise RuntimeError(
+            "Stage-1 GPU staging export currently only supports VLLM paged "
+            "KV connector."
+        )
+
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
@@ -1302,6 +1372,12 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
+
+    def export_staging_tensor(self, start: int, end: int, **kwargs) -> MemoryObj:
+        raise RuntimeError(
+            "Stage-1 GPU staging export does not support SGLang layerwise "
+            "connector."
+        )
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         raise NotImplementedError

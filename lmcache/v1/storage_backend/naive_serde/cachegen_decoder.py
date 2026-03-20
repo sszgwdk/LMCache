@@ -19,6 +19,7 @@ from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     BytesBufferMemoryObj,
+    CompressedMemoryObj,
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
@@ -64,10 +65,18 @@ class CacheGenDeserializer(Deserializer):
 
     # TODO(Jiayi): A lot of memory copies can be avoided in this function.
     @_lmcache_nvtx_annotate
-    def deserialize(self, buffer_memory_obj: BytesBufferMemoryObj) -> MemoryObj:
-        encoder_output = CacheGenGPUEncoderOutput.from_bytes(
-            buffer_memory_obj.byte_array
-        )
+    def deserialize(self, buffer_memory_obj: MemoryObj) -> MemoryObj:
+        if isinstance(buffer_memory_obj, CompressedMemoryObj):
+            payload = bytes(buffer_memory_obj.byte_array)
+        elif isinstance(buffer_memory_obj, BytesBufferMemoryObj):
+            payload = bytes(buffer_memory_obj.byte_array)
+        else:
+            raise TypeError(
+                "CacheGenDeserializer expects CompressedMemoryObj or "
+                "BytesBufferMemoryObj"
+            )
+
+        encoder_output = CacheGenGPUEncoderOutput.from_bytes(payload)
 
         encoder_output.max_tensors_key = encoder_output.max_tensors_key.cuda()
         encoder_output.max_tensors_value = encoder_output.max_tensors_value.cuda()
@@ -98,7 +107,7 @@ class CacheGenDeserializer(Deserializer):
             self.key_bins = self.key_bins.to(key.device)
 
         if self.value_bins.device != value.device:
-            self.value_bins = self.value_bins.cuda()
+            self.value_bins = self.value_bins.to(value.device)
 
         key = do_dequantize(key, self.key_bins, encoder_output.max_tensors_key)
         value = do_dequantize(value, self.value_bins, encoder_output.max_tensors_value)

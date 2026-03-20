@@ -32,6 +32,7 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.memory_management import (
+    CompressedMemoryObj,
     MemoryFormat,
     MemoryObj,
 )
@@ -366,6 +367,16 @@ class StorageManager:
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
         """
+        if any(
+            isinstance(memory_obj, CompressedMemoryObj)
+            or memory_obj.meta.fmt == MemoryFormat.BINARY
+            for memory_obj in memory_objs
+        ):
+            raise TypeError(
+                "Compressed payload objects must bypass StorageManager.batched_put() "
+                "and be written through LocalCPUBackend compressed mode directly"
+            )
+
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
             str,

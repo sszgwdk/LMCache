@@ -63,6 +63,9 @@ class LMCacheStats:
     active_memory_objs_count: int  # the number of active memory objects
     pinned_memory_objs_count: int  # the number of pinned memory objects
 
+    interval_gpu_encode_time_ms: List[float]
+    interval_gpu_decode_time_ms: List[float]
+
     # Distribution measurements
     time_to_retrieve: List[float]
     time_to_store: List[float]
@@ -201,6 +204,9 @@ class LMCStatsMonitor:
 
         self.active_memory_objs_count = 0
         self.pinned_memory_objs_count = 0
+
+        self.interval_gpu_encode_time_ms: List[float] = []
+        self.interval_gpu_decode_time_ms: List[float] = []
 
         self.retrieve_requests: Dict[int, RetrieveRequestStats] = {}
         self.store_requests: Dict[int, StoreRequestStats] = {}
@@ -397,6 +403,14 @@ class LMCStatsMonitor:
     def update_interval_prompt_tokens(self, delta: int):
         self.interval_prompt_tokens += delta
 
+    @thread_safe
+    def update_interval_gpu_encode_time_ms(self, encode_time_ms: float):
+        self.interval_gpu_encode_time_ms.append(encode_time_ms)
+
+    @thread_safe
+    def update_interval_gpu_decode_time_ms(self, decode_time_ms: float):
+        self.interval_gpu_decode_time_ms.append(decode_time_ms)
+
     def _clear(self):
         """
         Clear all the distribution stats
@@ -433,6 +447,9 @@ class LMCStatsMonitor:
 
         self.interval_p2p_requests = 0
         self.interval_p2p_transferred_tokens = 0
+
+        self.interval_gpu_encode_time_ms.clear()
+        self.interval_gpu_decode_time_ms.clear()
 
         self.interval_lookup_0_hit_requests = 0
 
@@ -519,7 +536,6 @@ class LMCStatsMonitor:
         )
 
         request_lifespan = list(self.interval_request_cache_lifespan.values())
-
         ret = LMCacheStats(
             interval_retrieve_requests=self.interval_retrieve_requests,
             interval_store_requests=self.interval_store_requests,
@@ -550,6 +566,8 @@ class LMCStatsMonitor:
             local_storage_usage_bytes=self.local_storage_usage_bytes,
             active_memory_objs_count=self.active_memory_objs_count,
             pinned_memory_objs_count=self.pinned_memory_objs_count,
+            interval_gpu_encode_time_ms=self.interval_gpu_encode_time_ms.copy(),
+            interval_gpu_decode_time_ms=self.interval_gpu_decode_time_ms.copy(),
             time_to_retrieve=time_to_retrieve,
             time_to_store=time_to_store,
             retrieve_speed=retrieve_speed,
@@ -766,6 +784,35 @@ class PrometheusLogger:
             documentation="The number of pinned memory objects",
             labelnames=labelnames,
             multiprocess_mode="sum",
+        )
+
+        gpu_codec_time_buckets_ms = [
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            20.0,
+            50.0,
+            100.0,
+            200.0,
+            500.0,
+            1000.0,
+        ]
+        self.histogram_gpu_encode_time_ms = self._histogram_cls(
+            name="lmcache:gpu_encode_time_ms",
+            documentation="GPU cachegen encode time (ms)",
+            labelnames=labelnames,
+            buckets=gpu_codec_time_buckets_ms,
+        )
+        self.histogram_gpu_decode_time_ms = self._histogram_cls(
+            name="lmcache:gpu_decode_time_ms",
+            documentation="GPU cachegen decode time (ms)",
+            labelnames=labelnames,
+            buckets=gpu_codec_time_buckets_ms,
         )
 
         time_to_retrieve_buckets = [
@@ -1245,7 +1292,6 @@ class PrometheusLogger:
             self.counter_lookup_0_hit_requests,
             stats.interval_lookup_0_hit_requests,
         )
-
         self._log_gauge(self.gauge_retrieve_hit_rate, stats.retrieve_hit_rate)
 
         self._log_gauge(self.gauge_lookup_hit_rate, stats.lookup_hit_rate)
@@ -1303,6 +1349,14 @@ class PrometheusLogger:
         )
         self._log_gauge(
             self.gauge_pinned_memory_objs_count, stats.pinned_memory_objs_count
+        )
+        self._log_histogram(
+            self.histogram_gpu_encode_time_ms,
+            stats.interval_gpu_encode_time_ms,
+        )
+        self._log_histogram(
+            self.histogram_gpu_decode_time_ms,
+            stats.interval_gpu_decode_time_ms,
         )
 
     @staticmethod

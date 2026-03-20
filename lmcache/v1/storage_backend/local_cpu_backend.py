@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence
+from enum import Enum
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, cast
 import threading
 import time
 
@@ -18,6 +19,8 @@ from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lazy_memory_allocator import LazyMixedMemoryAllocator
 from lmcache.v1.memory_management import (
+    CompressedMemoryAllocator,
+    CompressedMemoryObj,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -36,6 +39,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _LocalCPUBackendMode(Enum):
+    TENSOR = "tensor"
+    COMPRESSED = "compressed"
+
+
 class LocalCPUBackend(AllocatorBackendInterface):
     """
     Even if local_cpu is False (the hot_cache is not used), contains(),
@@ -45,8 +53,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     def __init__(
         self,
-        config: LMCacheEngineConfig,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        config,
+        metadata: Optional["LMCacheEngineMetadata"] = None,
         dst_device: str = "cuda",
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
@@ -56,10 +64,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
+        self.backend_mode = (
+            _LocalCPUBackendMode.COMPRESSED
+            if config.enable_local_compressed_cpu_tier
+            else _LocalCPUBackendMode.TENSOR
+        )
+        self._validate_compressed_mode_compatibility(config, metadata)
+
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
-        self.use_hot = config.local_cpu
+        # In compressed mode, local_cpu can be disabled by config validation,
+        # but this backend still serves as the CPU hot tier.
+        self.use_hot = config.local_cpu or self.is_compressed_mode
         # NOTE: we keep the memory allocator argument for temporary
         # test compatibility
         # TODO: fix the tests to get rid the memory allocator
@@ -69,6 +86,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if memory_allocator is None
             else memory_allocator
         )
+        if self.is_compressed_mode and not isinstance(
+            self.memory_allocator, CompressedMemoryAllocator
+        ):
+            raise AssertionError(
+                "LocalCPUBackend compressed mode requires CompressedMemoryAllocator"
+            )
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
@@ -103,6 +126,58 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.warning("Controller message sender is not initialized")
 
         self._setup_metrics()
+
+    @property
+    def is_compressed_mode(self) -> bool:
+        return self.backend_mode == _LocalCPUBackendMode.COMPRESSED
+
+    def _validate_compressed_mode_compatibility(
+        self,
+        config,
+        metadata: Optional["LMCacheEngineMetadata"],
+    ) -> None:
+        if not config.enable_local_compressed_cpu_tier:
+            return
+
+        assert not config.use_layerwise, (
+            "Local compressed CPU hot-tier does not support use_layerwise in stage 1"
+        )
+        assert not config.enable_blending, (
+            "Local compressed CPU hot-tier does not support blending in stage 1"
+        )
+        assert not config.enable_p2p, (
+            "Local compressed CPU hot-tier does not support p2p in stage 1"
+        )
+        assert config.remote_url is None, (
+            "Local compressed CPU hot-tier does not support remote backend in stage 1"
+        )
+        assert config.local_disk is None and config.max_local_disk_size <= 0, (
+            "Local compressed CPU hot-tier does not support local_disk in stage 1"
+        )
+        assert config.weka_path is None and config.gds_path is None, (
+            "Local compressed CPU hot-tier only supports LocalCPUBackend in stage 1"
+        )
+        assert not config.enable_pd, (
+            "Local compressed CPU hot-tier does not support PD mode in stage 1"
+        )
+        assert not config.external_backends, (
+            "Local compressed CPU hot-tier does not support external backends in "
+            "stage 1"
+        )
+        enable_nixl_storage = config.extra_config is not None and config.extra_config.get(
+            "enable_nixl_storage"
+        )
+        assert not enable_nixl_storage, (
+            "Local compressed CPU hot-tier does not support nixl storage backend in "
+            "stage 1"
+        )
+        assert config.remote_serde in (None, "naive", "cachegen"), (
+            "Local compressed CPU hot-tier only supports cachegen serde in stage 1"
+        )
+        if metadata is not None:
+            assert not metadata.use_mla, (
+                "Local compressed CPU hot-tier does not support MLA in stage 1"
+            )
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -146,6 +221,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
         Synchronously put the MemoryObj into the local cpu backend.
         """
+
+        if self.is_compressed_mode and not isinstance(memory_obj, CompressedMemoryObj):
+            raise TypeError(
+                "LocalCPUBackend compressed mode only accepts CompressedMemoryObj"
+            )
 
         with self.cpu_lock:
             if key in self.hot_cache:
@@ -272,7 +352,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def _calculate_effective_cpu_size(
         self,
         configured_cpu_size: float,
-        config: LMCacheEngineConfig,
+        config,
         metadata: Optional[LMCacheEngineMetadata] = None,
     ) -> float:
         """
@@ -327,8 +407,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     def initialize_allocator(
         self,
-        config: LMCacheEngineConfig,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        config,
+        metadata: Optional["LMCacheEngineMetadata"] = None,
     ) -> MemoryAllocatorInterface:
         cpu_size = config.max_local_cpu_size
 
@@ -352,6 +432,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         # Calculate effective CPU memory size
         cpu_size = self._calculate_effective_cpu_size(cpu_size, config, metadata)
+
+        if self.is_compressed_mode:
+            return CompressedMemoryAllocator(
+                int(cpu_size * 1024**3),
+                numa_mapping=numa_mapping,
+            )
 
         if config.enable_p2p:
             # TODO(baoloongmao): Add lazy memory allocator support for P2P mode
@@ -441,6 +527,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
         logger.debug(
             f"Allocating memory in local cpu backend with busy loop: {busy_loop}"
         )
+        if self.is_compressed_mode:
+            raise RuntimeError(
+                "LocalCPUBackend.allocate() is disabled in compressed mode. "
+                "Use allocate_compressed() for compressed payload objects."
+            )
+
         if fmt is None:
             if self.layerwise:
                 if self.enable_blending:
@@ -515,6 +607,57 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return memory_obj
 
     @_lmcache_nvtx_annotate
+    def allocate_compressed(
+        self,
+        payload_size: int,
+        fmt: MemoryFormat = MemoryFormat.BINARY,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[CompressedMemoryObj]:
+        if not self.is_compressed_mode:
+            raise RuntimeError(
+                "allocate_compressed() is only available when "
+                "enable_local_compressed_cpu_tier=True"
+            )
+
+        if payload_size <= 0:
+            raise ValueError("payload_size must be > 0")
+
+        assert isinstance(self.memory_allocator, CompressedMemoryAllocator)
+        compressed_allocator = cast(CompressedMemoryAllocator, self.memory_allocator)
+        shape = torch.Size([payload_size])
+        memory_obj = compressed_allocator.allocate(shape, None, fmt)
+        if memory_obj is not None or not eviction:
+            return memory_obj
+
+        while True:
+            wait_other_requests = True
+            if self.use_hot:
+                num_candidates = 1
+                with self.cpu_lock:
+                    evict_keys = self.cache_policy.get_evict_candidates(
+                        self.hot_cache, num_candidates=num_candidates
+                    )
+                    if evict_keys:
+                        wait_other_requests = False
+                        self.batched_remove(evict_keys, force=False)
+                    else:
+                        self.stats_monitor.update_local_cpu_evict_failed_count(
+                            num_candidates
+                        )
+
+            if wait_other_requests:
+                if not busy_loop:
+                    break
+                time.sleep(0.1)
+
+            memory_obj = compressed_allocator.allocate(shape, None, fmt)
+            if memory_obj is not None:
+                return memory_obj
+
+        return None
+
+    @_lmcache_nvtx_annotate
     def batched_allocate(
         self,
         shape: torch.Size,
@@ -534,6 +677,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             f"Batched allocating memory in local cpu backend"
             f" with busy loop: {busy_loop}"
         )
+        if self.is_compressed_mode:
+            raise RuntimeError(
+                "LocalCPUBackend.batched_allocate() is disabled in compressed mode. "
+                "Use batched_allocate_compressed() for compressed payload objects."
+            )
+
         if fmt is None:
             if self.layerwise:
                 if self.enable_blending:
@@ -627,6 +776,67 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_objs
 
+    @_lmcache_nvtx_annotate
+    def batched_allocate_compressed(
+        self,
+        payload_size: int,
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.BINARY,
+        eviction: bool = True,
+        busy_loop: bool = True,
+    ) -> Optional[List[CompressedMemoryObj]]:
+        if not self.is_compressed_mode:
+            raise RuntimeError(
+                "batched_allocate_compressed() is only available when "
+                "enable_local_compressed_cpu_tier=True"
+            )
+
+        if payload_size <= 0:
+            raise ValueError("payload_size must be > 0")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+
+        assert isinstance(self.memory_allocator, CompressedMemoryAllocator)
+        compressed_allocator = cast(CompressedMemoryAllocator, self.memory_allocator)
+        shape = torch.Size([payload_size])
+        memory_objs = compressed_allocator.batched_allocate(
+            shape, None, batch_size, fmt
+        )
+        if memory_objs is not None or not eviction:
+            return memory_objs
+
+        while True:
+            wait_other_requests = True
+            if self.use_hot:
+                num_candidates = 1
+                with self.cpu_lock:
+                    evict_keys = self.cache_policy.get_evict_candidates(
+                        self.hot_cache, num_candidates=num_candidates
+                    )
+                    if evict_keys:
+                        wait_other_requests = False
+                        self.batched_remove(evict_keys, force=False)
+                    else:
+                        self.stats_monitor.update_local_cpu_evict_failed_count(
+                            num_candidates
+                        )
+
+            if wait_other_requests:
+                if not busy_loop:
+                    break
+                time.sleep(0.1)
+
+            memory_objs = compressed_allocator.batched_allocate(
+                shape,
+                None,
+                batch_size,
+                fmt,
+            )
+            if memory_objs is not None:
+                return memory_objs
+
+        return None
+
     def calculate_chunk_budget(self) -> int:
         """
         Calculate the maximum number of chunks that can be allocated concurrently
@@ -669,7 +879,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # add alignment overhead
         # (MixedMemoryAllocator uses TensorMemoryAllocator with 4KB alignment)
         assert hasattr(self.memory_allocator, "align_bytes")
-        alignment = self.memory_allocator.align_bytes
+        alignment = getattr(self.memory_allocator, "align_bytes", None)
+        assert alignment is not None
         aligned_chunk_bytes = ((chunk_bytes + alignment - 1) // alignment) * alignment
 
         # calculate budget with safety margin

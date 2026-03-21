@@ -36,6 +36,7 @@ from lmcache.v1.gpu_connector import (
 )
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
+    CompressedMemoryAllocator,
     CompressedMemoryObj,
     MemoryAllocatorInterface,
     MemoryFormat,
@@ -627,7 +628,23 @@ class LMCacheEngine:
             # First Party
             from lmcache.v1.storage_backend.naive_serde import CreateSerde
 
-            serializer, deserializer = CreateSerde("cachegen", self.metadata, self.config)
+            compressed_allocator = None
+            if self._is_compressed_local_mode_enabled():
+                local_cpu_backend = self._get_local_cpu_backend()
+                if local_cpu_backend is not None and isinstance(
+                    local_cpu_backend.memory_allocator, CompressedMemoryAllocator
+                ):
+                    compressed_allocator = cast(
+                        CompressedMemoryAllocator,
+                        local_cpu_backend.memory_allocator,
+                    )
+
+            serializer, deserializer = CreateSerde(
+                "cachegen",
+                self.metadata,
+                self.config,
+                compressed_allocator=compressed_allocator,
+            )
             self._cachegen_serializer = serializer
             self._cachegen_deserializer = deserializer
         return self._cachegen_serializer, self._cachegen_deserializer
@@ -644,6 +661,9 @@ class LMCacheEngine:
         staging_obj = self.gpu_connector.export_staging_tensor(start, end, **kwargs)
         if hasattr(self.gpu_connector, "store_stream"):
             self.gpu_connector.store_stream.synchronize()
+
+        # staging_obj should be on GPU
+        # assert staging_obj.tensor.is_cuda, "Staging tensor should be on GPU"
         encode_start = time.perf_counter()
         compressed_obj = serializer.serialize(staging_obj)
         if not isinstance(compressed_obj, CompressedMemoryObj):

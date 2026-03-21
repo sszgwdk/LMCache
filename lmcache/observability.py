@@ -1407,15 +1407,86 @@ class LMCacheStatsLogger:
         self.prometheus_logger = PrometheusLogger.GetOrCreate(metadata)
         self.lmc_usage_logger = ContinuousUsageContext.GetOrCreate(metadata)
         self.is_running = True
+        self.log_codec_stats = os.getenv("LMCACHE_LOG_CODEC_STATS", "0") in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "on",
+        )
         # Event for interruptible sleep during shutdown
         self.shutdown_event = threading.Event()
 
         self.thread = threading.Thread(target=self.log_worker, daemon=True)
         self.thread.start()
 
+    @staticmethod
+    def _percentile(values: List[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        sorted_values = sorted(values)
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        # Linear interpolation to avoid percentile jumps for small samples.
+        rank = (len(sorted_values) - 1) * pct
+        low = int(rank)
+        high = min(low + 1, len(sorted_values) - 1)
+        frac = rank - low
+        return sorted_values[low] * (1 - frac) + sorted_values[high] * frac
+
+    def _log_codec_stats_summary(self, stats: LMCacheStats) -> None:
+        if not self.log_codec_stats:
+            return
+
+        def summarize(name: str, samples: List[float]) -> None:
+            if not samples:
+                return
+            avg = sum(samples) / len(samples)
+            p50 = self._percentile(samples, 0.5)
+            p95 = self._percentile(samples, 0.95)
+            p99 = self._percentile(samples, 0.99)
+            max_v = max(samples)
+            logger.warning(
+                "[LMCache codec] %s count=%d avg=%.3fms p50=%.3fms "
+                "p95=%.3fms p99=%.3fms max=%.3fms",
+                name,
+                len(samples),
+                avg,
+                p50,
+                p95,
+                p99,
+                max_v,
+            )
+
+        summarize("encode", stats.interval_gpu_encode_time_ms)
+        summarize("decode", stats.interval_gpu_decode_time_ms)
+
+        total_encode_ms = sum(stats.interval_gpu_encode_time_ms)
+        if total_encode_ms > 0:
+            encode_tps = stats.interval_stored_tokens / (total_encode_ms / 1000.0)
+            logger.warning(
+                "[LMCache codec] encode avg_throughput=%.3f tokens/s "
+                "tokens=%d total_time=%.3fms",
+                encode_tps,
+                stats.interval_stored_tokens,
+                total_encode_ms,
+            )
+
+        total_decode_ms = sum(stats.interval_gpu_decode_time_ms)
+        if total_decode_ms > 0:
+            decode_tps = stats.interval_hit_tokens / (total_decode_ms / 1000.0)
+            logger.warning(
+                "[LMCache codec] decode avg_throughput=%.3f tokens/s "
+                "tokens=%d total_time=%.3fms",
+                decode_tps,
+                stats.interval_hit_tokens,
+                total_decode_ms,
+            )
+
     def log_worker(self):
         while self.is_running:
             stats = self.monitor.get_stats_and_clear()
+            self._log_codec_stats_summary(stats)
             self.prometheus_logger.log_prometheus(stats)
             self.lmc_usage_logger.incr_or_send_stats(stats)
             # Use Event.wait() instead of time.sleep() for interruptible sleep
